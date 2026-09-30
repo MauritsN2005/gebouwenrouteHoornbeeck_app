@@ -1,4 +1,6 @@
 const STORAGE_KEY = 'hoornbeeck-campusroute-v3';
+const APP_VERSION = 'v9-lokaalkeuze';
+const CALIBRATION_KEY = 'hoornbeeck-map-calibration-v1';
 
 // Campuslocatie voor de campuscheck en live routebegeleiding.
 const CAMPUS = {
@@ -18,6 +20,7 @@ const BUILDINGS = [
       { id: 'hg-3', name: '3e verdieping', locals: ['C2.03', 'C2.08', 'C2.15'] },
       {
         id: 'hg-4', name: '4e verdieping', locals: ['4.08', '4.09', '4.10', '4.04', '4.03', '4.01', '4.VR'],
+        localAliases: { '4.03': ['B403'] },
         mapImage: 'assets/plattegrond-4e-verdieping.png',
         markers: {
           // Posities afgestemd op de kamerblokken op de aangeleverde plattegrond.
@@ -32,7 +35,7 @@ const BUILDINGS = [
           '4.VR': { x: 80, y: 18 }
         },
         // Route-netwerk op basis van de aangeleverde plattegrond.
-        // GPS wordt naar dit netwerk vertaald en daarna naar de dichtstbijzijnde knoop "gesnapt".
+        // Alleen de looproute volgt dit netwerk. De GPS-stip behoudt zijn eigen positie.
         routeStart: { x: 48, y: 54, label: 'Centrale trap / lift' },
         gpsMap: {
           // Dit is een instelbare kalibratie. Vervang dit met het echte GPS-punt
@@ -40,6 +43,9 @@ const BUILDINGS = [
           anchor: { latitude: 52.0171251, longitude: 4.6843562, x: 48, y: 54 },
           mapWidthMeters: 110,
           mapHeightMeters: 70,
+          // Deze gegevens zijn nog niet op locatie ingemeten. Een stip op deze
+          // kaart is daarom een schatting, ook als de GPS zelf nauwkeurig is.
+          calibrated: false,
           maxUsefulAccuracyMeters: 35
         },
         graph: {
@@ -119,6 +125,7 @@ const GPS_TRACKING = {
 };
 
 let state = loadState();
+let mapCalibrations = loadMapCalibrations();
 let currentRoute = 'route';
 let selectedBuildingId = null;
 let routeTarget = null;
@@ -131,6 +138,9 @@ let gpsRefreshPending = false;
 let gpsPermissionDenied = false;
 let lastRenderedGpsAt = 0;
 const lastIndoorPositions = new Map();
+const manualFloorPositions = new Map();
+let pendingMapCalibration = null;
+let mapCalibrationTimer = null;
 let arrival = {
   local: null,
   confirmations: 0,
@@ -173,6 +183,169 @@ function loadState() {
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+function mapSignature(floor) {
+  return JSON.stringify([floor.mapImage, floor.gpsMap.mapWidthMeters, floor.gpsMap.mapHeightMeters, floor.markers]);
+}
+
+function loadMapCalibrations() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CALIBRATION_KEY)) || {};
+    const valid = {};
+    for (const building of BUILDINGS) for (const floor of building.floors) {
+      const entry = saved[floor.id];
+      if (!floor.gpsMap || !entry || entry.signature !== mapSignature(floor) || !Array.isArray(entry.anchors) || !entry.anchors.length || entry.anchors.length > 2) continue;
+      const correct = entry.anchors.every(anchor => floor.locals.includes(anchor.local)
+        && [anchor.latitude, anchor.longitude, anchor.accuracy, anchor.measuredAt].every(Number.isFinite)
+        && Math.abs(anchor.latitude) <= 90 && Math.abs(anchor.longitude) <= 180
+        && anchor.accuracy >= 0);
+      if (correct && calibrationTransform(floor, entry)) valid[floor.id] = entry;
+    }
+    return valid;
+  } catch { return {}; }
+}
+
+function calibrationTransform(floor, entry) {
+  if (!entry?.anchors?.length) return null;
+  const first = entry.anchors[0];
+  const firstPoint = floor.markers[first.local];
+  const anchor = { latitude: first.latitude, longitude: first.longitude, ...firstPoint };
+  if (entry.anchors.length === 1) return { anchor, rotation: 0, scale: 1 };
+  const second = entry.anchors[1];
+  const secondPoint = floor.markers[second.local];
+  const gpsX = (second.longitude - first.longitude) * 111320 * Math.cos(first.latitude * Math.PI / 180);
+  const gpsY = -(second.latitude - first.latitude) * 110540;
+  const mapX = (secondPoint.x - firstPoint.x) / 100 * floor.gpsMap.mapWidthMeters;
+  const mapY = (secondPoint.y - firstPoint.y) / 100 * floor.gpsMap.mapHeightMeters;
+  const gpsDistance = Math.hypot(gpsX, gpsY);
+  const mapDistance = Math.hypot(mapX, mapY);
+  // Twee punten moeten ruim verder uit elkaar liggen dan hun meetfout.
+  if (gpsDistance < Math.max(15, 2 * (first.accuracy + second.accuracy)) || mapDistance < 10) return null;
+  const scale = mapDistance / gpsDistance;
+  if (scale < 0.25 || scale > 4) return null;
+  return { anchor, scale, rotation: Math.atan2(mapY, mapX) - Math.atan2(gpsY, gpsX) };
+}
+
+function floorGpsConfig(floor) {
+  const cfg = floor?.gpsMap;
+  if (!cfg) return null;
+  const transform = calibrationTransform(floor, mapCalibrations[floor.id]);
+  return { ...cfg, rotation: 0, scale: 1, ...transform };
+}
+
+function calibrationReadiness(floor) {
+  if (!gps.active || gps.updatedAt == null || gps.error || Date.now() - gps.updatedAt > 5000) {
+    return { ready: false, text: 'Wacht op een recente GPS-meting. Gebruik zo nodig Mijn locatie bijwerken.' };
+  }
+  if (gps.accuracy > floor.gpsMap.maxUsefulAccuracyMeters) {
+    return { ready: true, text: `GPS ±${Math.round(gps.accuracy)} m is onnauwkeurig. Je kunt je huidige lokaal koppelen; volgende posities kunnen ruim afwijken. Een telefoon of plek bij een raam kan een betere meting geven.` };
+  }
+  return { ready: true, text: `GPS ±${Math.round(gps.accuracy)} m. Kies het lokaal waar je nu echt bent.` };
+}
+
+function localLabel(floor, local) {
+  return [local, ...(floor.localAliases?.[local] || [])].join(' / ');
+}
+
+function resolveFloorLocal(floor, value) {
+  const normalize = text => String(text || '').toUpperCase().replace(/[.\s-]/g, '');
+  const name = normalize(value);
+  return floor.locals.find(local => [local, ...(floor.localAliases?.[local] || [])].some(alias => normalize(alias) === name));
+}
+
+function cancelPendingMapCalibration() {
+  if (pendingMapCalibration) {
+    const manual = manualFloorPositions.get(pendingMapCalibration.floorId);
+    if (manual) manual.pending = false;
+  }
+  pendingMapCalibration = null;
+  clearTimeout(mapCalibrationTimer);
+  mapCalibrationTimer = null;
+}
+
+function queueMapCalibration(floor, local, addSecondPoint) {
+  cancelPendingMapCalibration();
+  const requestedAt = Date.now();
+  manualFloorPositions.set(floor.id, { local, point: { ...floor.markers[local] }, pending: true });
+  pendingMapCalibration = { floorId: floor.id, local, addSecondPoint, requestedAt, expiresAt: requestedAt + 20000 };
+  resetArrivalTracking(routeTarget?.local || null);
+  render({ focus: false });
+  showToast(`Huidige plek: ${localLabel(floor, local)}. Blijf hier staan terwijl GPS opnieuw wordt gemeten.`);
+  mapCalibrationTimer = setTimeout(() => {
+    cancelPendingMapCalibration();
+    scheduleGpsUiUpdate();
+    showToast('Nog geen nieuwe GPS-meting. Je gekozen plek blijft handmatig zichtbaar; bevestig je huidige plek opnieuw om GPS te koppelen.');
+  }, 20000);
+  if (gps.supported) {
+    if (geoWatchId === null) startGPS({ silent: true });
+    else requestGpsPosition();
+  }
+}
+
+function calibrationStatusText(floor) {
+  const manual = manualFloorPositions.get(floor.id);
+  if (manual) return manual.pending
+    ? `Lokaal ${localLabel(floor, manual.local)} gekozen. Blijf hier staan: een nieuwe GPS-meting wordt opgehaald.`
+    : `Lokaal ${localLabel(floor, manual.local)} is handmatig aangegeven. GPS is nog niet gekoppeld; bevestig je huidige plek opnieuw om te proberen.`;
+  return calibrationReadiness(floor).text;
+}
+
+function setMapCalibration(floor, local, addSecondPoint = false) {
+  local = resolveFloorLocal(floor, local);
+  const ready = calibrationReadiness(floor);
+  if (!floor.locals.includes(local)) return showToast('Kies eerst het lokaal waar je nu bent.');
+  if (addSecondPoint && !mapCalibrations[floor.id]) return showToast('Stel eerst je huidige plek in.');
+  if (!ready.ready) return queueMapCalibration(floor, local, addSecondPoint);
+  cancelPendingMapCalibration();
+  const anchor = { local, latitude: gps.latitude, longitude: gps.longitude, accuracy: gps.accuracy, measuredAt: gps.updatedAt };
+  const previous = mapCalibrations[floor.id];
+  if (addSecondPoint && !previous) return showToast('Stel eerst je huidige plek in.');
+  const entry = { signature: mapSignature(floor), anchors: addSecondPoint ? [previous.anchors[0], anchor] : [anchor] };
+  if (!calibrationTransform(floor, entry)) return showToast('Deze punten liggen te dicht bij elkaar of de GPS-afwijking is te groot. Loop naar een verder gelegen lokaal en probeer opnieuw.');
+  const next = { ...mapCalibrations, [floor.id]: entry };
+  let persisted = true;
+  try { localStorage.setItem(CALIBRATION_KEY, JSON.stringify(next)); } catch { persisted = false; }
+  mapCalibrations = next;
+  manualFloorPositions.delete(floor.id);
+  lastIndoorPositions.delete(floor.id);
+  resetArrivalTracking(routeTarget?.local || null);
+  render({ focus: false });
+  showToast(persisted ? 'Kaart afgesteld. Nieuwe GPS-metingen blijven je positie bijwerken.' : 'Kaart afgesteld voor deze sessie; opslaan is niet gelukt.');
+  document.querySelector('.route-map')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function resetMapCalibration(floor) {
+  const next = { ...mapCalibrations };
+  delete next[floor.id];
+  try { localStorage.setItem(CALIBRATION_KEY, JSON.stringify(next)); }
+  catch { return showToast('De opgeslagen afstelling kon niet worden gewist.'); }
+  mapCalibrations = next;
+  cancelPendingMapCalibration();
+  manualFloorPositions.delete(floor.id);
+  lastIndoorPositions.delete(floor.id);
+  resetArrivalTracking(routeTarget?.local || null);
+  render({ focus: false });
+  showToast('Kaartafstelling gewist.');
+}
+
+function renderMapCalibration(floor, outsideMap) {
+  const entry = mapCalibrations[floor.id];
+  const manual = manualFloorPositions.get(floor.id);
+  const selected = manual?.local || '';
+  return `<details class="map-calibration" ${outsideMap && !entry || manual ? 'open' : ''}>
+    <summary>Kaartpositie afstellen</summary>
+    <p>Klik op het lokaal waar je nu bent en bevestig je keuze. Je plek verschijnt direct op de kaart. Zonder recente GPS-meting blijft dit een handmatig aangegeven plek totdat GPS is gekoppeld.</p>
+    <p id="calibration-local-label">Ik ben nu in lokaal</p>
+    <input type="hidden" data-calibration-local value="${escapeHtml(selected)}">
+    <div class="calibration-rooms" role="group" aria-labelledby="calibration-local-label">${floor.locals.map(local => `<button type="button" class="calibration-room" data-current-local="${escapeHtml(local)}" aria-pressed="${selected === local}">${escapeHtml(local)}${floor.localAliases?.[local] ? `<small>${floor.localAliases[local].map(escapeHtml).join(' / ')}</small>` : ''}</button>`).join('')}</div>
+    <p data-calibration-choice>${selected ? `Gekozen: ${escapeHtml(localLabel(floor, selected))}` : 'Klik hierboven op je huidige lokaal.'}</p>
+    <div class="action-row"><button class="primary" data-action="calibrate-map" ${selected ? '' : 'disabled'}>Gebruik als huidige plek</button>
+      ${entry ? `<button class="secondary" data-action="calibration-second-point" ${selected ? '' : 'disabled'}>Tweede referentiepunt toevoegen</button><button class="secondary" data-action="calibration-reset">Afstelling wissen</button>` : ''}
+    </div>
+    <p data-calibration-readiness role="status">${escapeHtml(calibrationStatusText(floor))}</p>
+    ${entry ? `<p>Op dit apparaat opgeslagen: ${entry.anchors.map(a => escapeHtml(a.local)).join(' → ')}. ${entry.anchors.length === 1 ? 'Voor een betere richting en schaal: loop naar een verder gelegen lokaal, selecteer dat lokaal en voeg het als tweede referentiepunt toe.' : 'Het referentiepunt, de richting en de schaal zijn afgesteld met twee GPS-metingen.'}</p>` : ''}
+  </details>`;
 }
 
 function levelFromXP(xp) { return Math.floor(xp / XP_PER_LEVEL) + 1; }
@@ -337,34 +510,39 @@ function renderRoute() {
 }
 
 function projectGpsToFloorMap(floor, options = {}) {
-  const cfg = floor?.gpsMap;
+  const cfg = floorGpsConfig(floor);
   const clamp = options.clamp !== false;
   if (!cfg || !gps.active || !isGpsFresh() || gps.error || gps.latitude == null || gps.longitude == null || gps.accuracy == null) return null;
-  if (gps.accuracy > cfg.maxUsefulAccuracyMeters) return null;
+  // Een zwakke meting mag de live kaart niet bevriezen. Voor aankomstcontrole
+  // blijft de nauwkeurigheidseis wel gelden (de standaard van deze functie).
+  if (options.requireAccuracy !== false && gps.accuracy > cfg.maxUsefulAccuracyMeters) return null;
 
   const latScale = 110540;
   const lonScale = 111320 * Math.cos(cfg.anchor.latitude * Math.PI / 180);
   const dx = (gps.longitude - cfg.anchor.longitude) * lonScale;
   const dyNorth = (gps.latitude - cfg.anchor.latitude) * latScale;
 
-  const x = cfg.anchor.x + (dx / cfg.mapWidthMeters) * 100;
-  const y = cfg.anchor.y - (dyNorth / cfg.mapHeightMeters) * 100;
+  const mapDx = cfg.scale * (dx * Math.cos(cfg.rotation) + dyNorth * Math.sin(cfg.rotation));
+  const mapDy = cfg.scale * (dx * Math.sin(cfg.rotation) - dyNorth * Math.cos(cfg.rotation));
+  const x = cfg.anchor.x + (mapDx / cfg.mapWidthMeters) * 100;
+  const y = cfg.anchor.y + (mapDy / cfg.mapHeightMeters) * 100;
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   if (!clamp) return { x, y };
   return { x: Math.max(3, Math.min(97, x)), y: Math.max(3, Math.min(97, y)) };
 }
 
 function mapDistanceMeters(floor, a, b) {
-  const cfg = floor?.gpsMap;
+  const cfg = floorGpsConfig(floor);
   if (!cfg || !a || !b) return Infinity;
   const dx = ((a.x - b.x) / 100) * cfg.mapWidthMeters;
   const dy = ((a.y - b.y) / 100) * cfg.mapHeightMeters;
-  return Math.hypot(dx, dy);
+  return Math.hypot(dx, dy) / cfg.scale;
 }
 
 function targetArrivalStatus(target) {
   if (!target) return { state: 'none', distanceMeters: null, text: '' };
   if (state.discoveredLocals.includes(target.local)) return { state: 'done', distanceMeters: 0, text: 'Locatie al ontdekt ✓' };
+  if (manualFloorPositions.has(target.floor.id)) return { state: 'gps', distanceMeters: null, text: 'Je plek is handmatig aangegeven. Koppel eerst een nieuwe GPS-meting voor aankomstcontrole.' };
   if (!gps.active || gps.latitude == null || gps.longitude == null) return { state: 'gps', distanceMeters: null, text: 'Activeer GPS om je aankomst te controleren.' };
   if (!isGpsFresh() || gps.error) return { state: 'gps', distanceMeters: null, text: 'Wacht op een nieuwe GPS-meting om je aankomst te controleren.' };
   if (!gps.insideCampus) return { state: 'campus', distanceMeters: gps.distanceMeters, text: 'Ga eerst naar de campus.' };
@@ -402,6 +580,7 @@ function checkRouteArrival() {
   if (currentRoute !== 'route' || !routeTarget) return false;
   const target = getRouteTarget();
   if (!target || state.discoveredLocals.includes(target.local)) return false;
+  if (manualFloorPositions.has(target.floor.id)) { resetArrivalTracking(target.local); return false; }
   if (!gps.active || !isGpsFresh() || gps.error || !gps.insideCampus || gps.accuracy == null || gps.accuracy > ARRIVAL.maxAccuracyMeters) {
     if (arrival.local === target.local && arrival.confirmations) resetArrivalTracking(target.local);
     return false;
@@ -494,22 +673,61 @@ function shortestPath(floor, startId, endId) {
 }
 
 function floorLocation(floor) {
-  const projected = gps.insideCampus ? projectGpsToFloorMap(floor, { clamp: false }) : null;
-  if (projected && projected.x >= 0 && projected.x <= 100 && projected.y >= 0 && projected.y <= 100) {
-    lastIndoorPositions.set(floor.id, { point: projected, accuracy: gps.accuracy, updatedAt: gps.updatedAt });
-    return { point: projected, live: true, known: true, label: 'Jouw actuele positie' };
+  const manual = manualFloorPositions.get(floor.id);
+  if (manual) return {
+    point: manual.point, accuracy: null, outsideMap: false, live: false, known: true, manual: true,
+    label: `Handmatig aangegeven: ${localLabel(floor, manual.local)}`,
+    reason: manual.pending ? 'Blijf op deze plek staan terwijl een nieuwe GPS-meting wordt gekoppeld.' : 'Nog geen GPS-koppeling. Bevestig je huidige plek opnieuw om GPS te koppelen.'
+  };
+  const projected = projectGpsToFloorMap(floor, { clamp: false, requireAccuracy: false });
+  if (projected) {
+    const outsideMap = projected.x < 0 || projected.x > 100 || projected.y < 0 || projected.y > 100;
+    const position = { point: projected, accuracy: gps.accuracy, updatedAt: gps.updatedAt, outsideMap };
+    lastIndoorPositions.set(floor.id, position);
+    return {
+      ...position, live: true, known: true,
+      label: outsideMap ? 'GPS-positie buiten de plattegrond' : 'Jouw geschatte GPS-positie',
+      reason: outsideMap ? 'De GPS-schatting ligt buiten deze kaart. Ben je wel in dit gebouw? Gebruik Kaartpositie afstellen hieronder.'
+        : gps.accuracy > floor.gpsMap.maxUsefulAccuracyMeters ? 'Onnauwkeurige GPS-meting: de stip en route zijn een ruime schatting.' : ''
+    };
   }
   const last = lastIndoorPositions.get(floor.id);
-  const reason = !gps.active ? 'Activeer GPS voor je actuele positie.'
-    : !isGpsFresh() || gps.error ? 'Wachten op een nieuwe GPS-meting.'
-    : gps.accuracy > floor.gpsMap.maxUsefulAccuracyMeters ? `GPS is te onnauwkeurig (±${Math.round(gps.accuracy)} m).`
-    : 'Je GPS-positie ligt buiten deze plattegrond.';
+  const reason = !gps.active ? 'Activeer GPS voor je actuele positie.' : 'Wachten op een nieuwe GPS-meting.';
   return {
     point: last?.point || floor.routeStart,
+    accuracy: last?.accuracy ?? null,
+    outsideMap: last?.outsideMap || false,
     live: false,
     known: Boolean(last),
     label: last ? 'Laatst bekende positie' : `Startpunt: ${floor.routeStart.label}`,
     reason
+  };
+}
+
+function mapMarkerPoint(position) {
+  if (!position.outsideMap) return position.point;
+  // Een positie buiten de kaart wordt als richtingaanwijzer aan de rand
+  // getoond, nooit als een verzonnen locatie binnen een lokaal.
+  const dx = position.point.x - 50;
+  const dy = position.point.y - 50;
+  const scale = 47 / Math.max(Math.abs(dx), Math.abs(dy));
+  return { x: 50 + dx * scale, y: 50 + dy * scale };
+}
+
+function routeMapDisplay(route, floor) {
+  const position = route.position;
+  const cfg = floorGpsConfig(floor);
+  const liveOnMap = position.live && !position.outsideMap;
+  const direction = ['→', '↘', '↓', '↙', '←', '↖', '↑', '↗'][Math.round(Math.atan2(position.point.y - 50, position.point.x - 50) / (Math.PI / 4) + 8) % 8];
+  return {
+    marker: mapMarkerPoint(position),
+    label: position.manual ? 'Handmatig aangegeven' : position.outsideMap ? 'GPS buiten kaart' : position.live ? 'Live GPS-schatting' : position.known ? 'Laatste positie' : 'Wacht op GPS',
+    markerText: position.outsideMap ? `GPS ${direction}` : position.known ? 'JIJ' : 'START',
+    liveOnMap,
+    note: [position.reason, position.live ? gpsUpdateLabel() : ''].filter(Boolean).join(' '),
+    distance: position.outsideMap ? 'Geen binnenroute vanaf deze GPS-positie' : `${routeDistanceLabel(floor, route.points)} geschatte route`,
+    radiusX: position.accuracy == null ? 0 : position.accuracy * cfg.scale / cfg.mapWidthMeters * 100,
+    radiusY: position.accuracy == null ? 0 : position.accuracy * cfg.scale / cfg.mapHeightMeters * 100
   };
 }
 
@@ -540,16 +758,18 @@ function routePointsForTarget(target) {
   const floor = target.floor;
   const targetNode = Object.entries(floor.graph?.nodes || {}).find(([id, node]) => node.x === floor.markers?.[target.local]?.x && node.y === floor.markers?.[target.local]?.y)?.[0];
   const position = floorLocation(floor);
+  if (position.outsideMap) return { points: [], startPoint: position.point, position, usedGpsStart: position.live, startNode: null };
   const edge = nearestGraphEdge(floor, position.point);
-  const startPoint = edge?.point || position.point;
-  const startNode = nearestGraphNode(floor, startPoint);
+  const startPoint = position.point;
+  const corridorPoint = edge?.point || startPoint;
+  const startNode = nearestGraphNode(floor, corridorPoint);
   const nodeMap = { '4.08':'L408','4.09':'L409','4.10':'L410','4.04':'L404','4.03':'L403','4.01':'L401','4.VR':'LVR' };
   const endNode = nodeMap[target.local] || targetNode;
   let points = shortestPath(floor, startNode, endNode);
   if (edge) {
     const candidates = [edge.a, edge.b].map(id => {
       const path = shortestPath(floor, id, endNode);
-      return path.length ? [startPoint, ...path] : [];
+      return path.length ? [startPoint, corridorPoint, ...path] : [];
     }).filter(path => path.length);
     candidates.sort((a, b) => routeDistanceMeters(floor, a) - routeDistanceMeters(floor, b));
     if (candidates.length) points = candidates[0];
@@ -573,35 +793,39 @@ function renderIndoorRoute(target) {
   const floor = target.floor;
   const targetPos = floor.markers[target.local];
   const route = routePointsForTarget(target);
+  const display = routeMapDisplay(route, floor);
   const polyline = route.points.map(p => `${p.x},${p.y}`).join(' ');
   const discovered = state.discoveredLocals.includes(target.local);
-  const campusReady = route.position.live;
+  const campusReady = display.liveOnMap;
   const arrivalStatus = targetArrivalStatus(target);
   const accuracyNote = gps.active && gps.accuracy != null ? `GPS ±${Math.round(gps.accuracy)} m` : 'GPS niet actief';
   const startLabel = route.position.label;
-  const locationNote = route.position.live ? gpsUpdateLabel() : route.position.reason;
+  const locationNote = display.note;
   const arrivalClass = arrivalStatus.state === 'arrived' || arrivalStatus.state === 'done' ? 'done' : '';
   const arrivalText = discovered ? 'XP is al toegekend voor deze locatie.' : arrivalStatus.text;
 
   return `<section class="card route-map-card" data-current-target="${escapeHtml(target.local)}">
     <div class="section-head map-head">
       <div><div class="eyebrow">Dynamische binnenroute</div><h2>${escapeHtml(floor.name)}</h2></div>
-      <span class="map-status ${campusReady ? 'done' : ''}">${campusReady ? 'Live positie ✓' : route.position.known ? 'Laatste positie' : 'Wacht op GPS'}</span>
+      <span class="map-status ${campusReady ? 'done' : ''}">${display.label}</span>
     </div>
-    <p class="map-help">Kies een lokaal en de route wordt opnieuw berekend vanaf je actuele positie. Je positie en de route worden automatisch bijgewerkt terwijl je loopt.</p>
+    <p class="map-help">De stip volgt elke nieuwe GPS-meting. De blauwe lijn begint bij de stip en wordt tijdens het lopen opnieuw berekend. Het gekleurde gebied toont de door GPS opgegeven nauwkeurigheid.</p>
     <div class="floor-map route-map ${campusReady ? 'is-ready' : ''}">
       <img src="${floor.mapImage}" alt="Plattegrond met dynamische route naar lokaal ${escapeHtml(target.local)}">
       <svg class="route-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+        <ellipse class="gps-accuracy-area ${route.position.live ? '' : 'is-stale'}" cx="${display.marker.x}" cy="${display.marker.y}" rx="${display.radiusX}" ry="${display.radiusY}" ${route.position.known && !route.position.outsideMap ? '' : 'hidden'} />
         <polyline class="route-shadow" points="${polyline}" />
         <polyline class="route-path" points="${polyline}" />
       </svg>
-      <div class="route-start-marker ${campusReady ? '' : 'is-stale'}" style="left:${route.startPoint.x}%;top:${route.startPoint.y}%" aria-label="${escapeHtml(startLabel)}"><span>${route.position.known ? 'JIJ' : 'START'}</span></div>
+      <div class="route-start-marker ${campusReady ? '' : 'is-stale'} ${route.position.outsideMap ? 'is-outside' : ''}" style="left:${display.marker.x}%;top:${display.marker.y}%" aria-label="${escapeHtml(startLabel)}"><span>${display.markerText}</span></div>
       <div class="route-end-marker" style="left:${targetPos.x}%;top:${targetPos.y}%"><span>${escapeHtml(target.local)}</span></div>
     </div>
     <div class="route-live-box">
-      <div><strong data-position-label>${escapeHtml(startLabel)}</strong><small data-route-distance>${escapeHtml(accuracyNote)} · ${routeDistanceLabel(floor, route.points)} geschatte route</small><small data-location-note>${escapeHtml(locationNote)}</small></div>
+      <div><strong data-position-label>${escapeHtml(startLabel)}</strong><small data-route-distance>${escapeHtml(accuracyNote)} · ${display.distance}</small><small data-location-note>${escapeHtml(locationNote)}</small></div>
       <button class="secondary" data-action="gps-refresh">Mijn locatie bijwerken</button>
     </div>
+    ${renderMapCalibration(floor, route.position.outsideMap)}
+    <p class="map-help">${mapCalibrations[floor.id] ? 'De kaart gebruikt je opgeslagen afstelling. ' : 'De plaatsing op deze plattegrond is nog niet afgesteld op je apparaat. '}GPS blijft een schatting en bepaalt niet op welke verdieping je bent. <span class="app-version">${APP_VERSION}</span></p>
     <div class="arrival-box ${arrivalClass}">
       <div><div class="eyebrow">Aankomstcontrole</div><strong data-arrival-title>${discovered ? 'Locatie bereikt' : arrivalStatus.state === 'arrived' ? 'Aankomst bevestigd' : 'XP pas bij echte aankomst'}</strong><small data-arrival-text>${escapeHtml(arrivalText)}</small></div>
       <span class="arrival-distance">${arrivalStatus.distanceMeters == null ? '—' : formatDistance(arrivalStatus.distanceMeters)}</span>
@@ -798,21 +1022,35 @@ function updateGpsUi() {
   if (!target || !mapCard || mapCard.dataset.currentTarget !== target.local) return;
   const route = routePointsForTarget(target);
   const polyline = route.points.map(point => `${point.x},${point.y}`).join(' ');
+  const display = routeMapDisplay(route, target.floor);
   mapCard.querySelectorAll('.route-path, .route-shadow').forEach(line => line.setAttribute('points', polyline));
   const marker = mapCard.querySelector('.route-start-marker');
-  marker.style.left = `${route.startPoint.x}%`;
-  marker.style.top = `${route.startPoint.y}%`;
-  marker.classList.toggle('is-stale', !route.position.live);
+  marker.style.left = `${display.marker.x}%`;
+  marker.style.top = `${display.marker.y}%`;
+  marker.classList.toggle('is-stale', !display.liveOnMap);
+  marker.classList.toggle('is-outside', route.position.outsideMap);
   marker.setAttribute('aria-label', route.position.label);
-  marker.querySelector('span').textContent = route.position.known ? 'JIJ' : 'START';
-  mapCard.querySelector('.route-map').classList.toggle('is-ready', route.position.live);
+  marker.querySelector('span').textContent = display.markerText;
+  const accuracyArea = mapCard.querySelector('.gps-accuracy-area');
+  for (const [name, value] of Object.entries({ cx: display.marker.x, cy: display.marker.y, rx: display.radiusX, ry: display.radiusY })) accuracyArea.setAttribute(name, String(value));
+  accuracyArea.toggleAttribute('hidden', !route.position.known || route.position.outsideMap);
+  accuracyArea.classList.toggle('is-stale', !route.position.live);
+  mapCard.querySelector('.route-map').classList.toggle('is-ready', display.liveOnMap);
   const mapStatus = mapCard.querySelector('.map-status');
-  mapStatus.classList.toggle('done', route.position.live);
-  mapStatus.textContent = route.position.live ? 'Live positie ✓' : route.position.known ? 'Laatste positie' : 'Wacht op GPS';
+  mapStatus.classList.toggle('done', display.liveOnMap);
+  mapStatus.textContent = display.label;
   mapCard.querySelector('[data-position-label]').textContent = route.position.label;
   const accuracy = gps.active && gps.accuracy != null ? `GPS ±${Math.round(gps.accuracy)} m` : 'GPS niet actief';
-  mapCard.querySelector('[data-route-distance]').textContent = `${accuracy} · ${routeDistanceLabel(target.floor, route.points)} geschatte route`;
-  mapCard.querySelector('[data-location-note]').textContent = route.position.live ? gpsUpdateLabel() : route.position.reason;
+  mapCard.querySelector('[data-route-distance]').textContent = `${accuracy} · ${display.distance}`;
+  mapCard.querySelector('[data-location-note]').textContent = display.note;
+  mapCard.querySelector('[data-calibration-readiness]').textContent = calibrationStatusText(target.floor);
+  const chosenLocal = mapCard.querySelector('[data-calibration-local]').value;
+  mapCard.querySelectorAll('[data-action="calibrate-map"], [data-action="calibration-second-point"]').forEach(button => { button.disabled = !chosenLocal; });
+  const calibrationPanel = mapCard.querySelector('.map-calibration');
+  if (route.position.outsideMap && !mapCalibrations[target.floor.id] && !calibrationPanel.dataset.revealed) {
+    calibrationPanel.open = true;
+    calibrationPanel.dataset.revealed = 'true';
+  }
   const status = targetArrivalStatus(target);
   const discovered = state.discoveredLocals.includes(target.local);
   mapCard.querySelector('.arrival-box').classList.toggle('done', discovered || status.state === 'arrived');
@@ -878,6 +1116,11 @@ function handlePosition(position) {
   const distance = haversineDistance(latitude, longitude, CAMPUS.latitude, CAMPUS.longitude);
   const previousInside = gps.insideCampus;
   gps = { ...gps, active: true, error: null, latitude, longitude, accuracy, distanceMeters: distance, insideCampus: distance <= CAMPUS.radiusMeters, updatedAt: measuredAt };
+  const pending = pendingMapCalibration;
+  if (pending && measuredAt >= pending.requestedAt && Date.now() <= pending.expiresAt) {
+    const floor = BUILDINGS.flatMap(building => building.floors).find(floor => floor.id === pending.floorId);
+    if (floor && calibrationReadiness(floor).ready) setMapCalibration(floor, pending.local, pending.addSecondPoint);
+  }
   // Bewaar bruikbare posities ook wanneer een ander scherm geopend is.
   for (const building of BUILDINGS) for (const floor of building.floors) {
     if (floor.gpsMap) floorLocation(floor);
@@ -905,6 +1148,7 @@ function handlePositionError(error) {
 }
 
 function stopGPS() {
+  cancelPendingMapCalibration();
   gpsSession += 1;
   if (geoWatchId !== null && 'geolocation' in navigator) navigator.geolocation.clearWatch(geoWatchId);
   geoWatchId = null;
@@ -966,6 +1210,27 @@ function bindPageEvents() {
     else requestGpsPosition();
   });
 
+  for (const [action, secondPoint] of [['calibrate-map', false], ['calibration-second-point', true]]) {
+    document.querySelector(`[data-action="${action}"]`)?.addEventListener('click', () => {
+      const target = getRouteTarget();
+      const local = document.querySelector('[data-calibration-local]')?.value;
+      if (target?.floor?.gpsMap) setMapCalibration(target.floor, local, secondPoint);
+    });
+  }
+  document.querySelectorAll('[data-current-local]').forEach(button => button.addEventListener('click', () => {
+    const target = getRouteTarget();
+    if (!target?.floor?.gpsMap) return;
+    const local = button.dataset.currentLocal;
+    document.querySelector('[data-calibration-local]').value = local;
+    document.querySelectorAll('[data-current-local]').forEach(option => option.setAttribute('aria-pressed', String(option.dataset.currentLocal === local)));
+    document.querySelector('[data-calibration-choice]').textContent = `Gekozen: ${localLabel(target.floor, local)}`;
+    document.querySelectorAll('[data-action="calibrate-map"], [data-action="calibration-second-point"]').forEach(action => { action.disabled = false; });
+  }));
+  document.querySelector('[data-action="calibration-reset"]')?.addEventListener('click', () => {
+    const target = getRouteTarget();
+    if (target?.floor?.gpsMap) resetMapCalibration(target.floor);
+  });
+
   document.querySelector('[data-action="discover-route-target"]')?.addEventListener('click', () => {
     const target = getRouteTarget();
     if (!target) return navigate('profile');
@@ -1013,7 +1278,7 @@ window.addEventListener('pageshow', event => {
 });
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(console.error));
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(registration => registration.update()).catch(console.error));
 }
 
 window.addEventListener('offline', () => {
